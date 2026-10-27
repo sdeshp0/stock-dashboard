@@ -69,3 +69,100 @@ def month_outlook(stats: pd.DataFrame, month: int) -> dict | None:
     n = int(row["Years"])
     return {"month": MONTHS[month - 1], "avg": row["Avg"], "median": row["Median"],
             "up": round(row["% Up"] * n), "years": n}
+
+
+# ---- Within-year shape and calendar effects (daily data) ----
+
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+TURN_WINDOW = 5  # trading days either side of month end for the turn-of-month view
+
+
+def seasonal_paths(close: pd.Series) -> pd.DataFrame:
+    """Each calendar year's cumulative return by trading day of the year,
+    measured from the previous year's last close (so day 1 includes the first
+    session's move). Rows are trading day 1, 2, ...; columns are years. The
+    first year of data is dropped, since it has no prior year-end close."""
+    close = close.dropna()
+    year_end = close.groupby(close.index.year).last()
+    paths = {}
+    for year, s in close.groupby(close.index.year):
+        if year - 1 not in year_end.index:
+            continue
+        paths[int(year)] = (s / year_end[year - 1] - 1).reset_index(drop=True)
+    out = pd.DataFrame(paths)
+    out.index = out.index + 1
+    out.index.name = "day"
+    return out
+
+
+def typical_path(paths: pd.DataFrame, exclude: int | None = None) -> pd.DataFrame:
+    """Median and interquartile band across years for each trading day, plus
+    how many years reach that day. `exclude` leaves out a year (the current,
+    unfinished one). Median rather than mean so one extreme year doesn't
+    reshape the curve."""
+    p = paths.drop(columns=[exclude], errors="ignore")
+    return pd.DataFrame({"median": p.median(axis=1), "q25": p.quantile(0.25, axis=1),
+                         "q75": p.quantile(0.75, axis=1), "years": p.count(axis=1)})
+
+
+def _daily(close: pd.Series) -> pd.DataFrame:
+    """Daily returns with each day's position in its month: `from_start` (1 =
+    first session) and `from_end` (-1 = last session). If the data starts
+    mid-month, that first month is dropped (its first sessions are missing),
+    and an unfinished last month has no `from_end`, since its real last
+    session hasn't happened yet."""
+    close = close.dropna()
+    df = pd.DataFrame({"ret": close.pct_change()}, index=close.index).iloc[1:]
+    key = df.index.to_period("M")
+    if len(df) and close.index[0].to_period("M") == key[0]:
+        df = df[key != key[0]]
+    key = df.index.to_period("M")
+    df["from_start"] = df.groupby(key).cumcount() + 1
+    df["from_end"] = df.groupby(key).cumcount(ascending=False) * -1 - 1
+    if len(df):
+        _, partial = monthly_returns(close)
+        if partial:
+            df.loc[key == key[-1], "from_end"] = pd.NA
+    return df
+
+
+def _ret_stats(g) -> pd.DataFrame:
+    return pd.DataFrame({"Avg": g.mean(), "% Up": g.apply(lambda s: (s > 0).mean()),
+                         "Days": g.count()})
+
+
+def turn_of_month(close: pd.Series, window: int = TURN_WINDOW) -> tuple[pd.DataFrame, float]:
+    """(stats by offset, average of all days). Offsets run -window..-1 for the
+    last sessions of a month (T-1 = last day) and +1..+window for the first
+    sessions of the next (T+1 = first day). Stats are Avg, % Up, Days."""
+    df = _daily(close)
+    if df.empty:
+        return pd.DataFrame(columns=["Avg", "% Up", "Days"]), float("nan")
+    end = df.loc[df["from_end"] >= -window]
+    start = df.loc[df["from_start"] <= window]
+    offs = pd.concat([pd.Series(end["ret"].to_numpy(), index=end["from_end"].astype(int)),
+                      pd.Series(start["ret"].to_numpy(), index=start["from_start"].astype(int))])
+    order = list(range(-window, 0)) + list(range(1, window + 1))
+    stats = _ret_stats(offs.groupby(level=0)).reindex(order)
+    stats.index = [f"T{o:+d}" for o in order]
+    return stats, float(df["ret"].mean())
+
+
+def weekday_stats(close: pd.Series) -> pd.DataFrame:
+    """Avg, % Up and Days of daily returns by weekday (Mon..Fri)."""
+    df = _daily(close)
+    stats = _ret_stats(df["ret"].groupby(df.index.dayofweek)).reindex(range(5))
+    stats.index = WEEKDAYS
+    return stats
+
+
+def last_n_years(close: pd.Series, years: int | None) -> pd.Series:
+    """Trim daily closes to the last `years` calendar years, keeping the
+    previous year's last close as the base for the first year's returns."""
+    close = close.dropna()
+    if years is None or close.empty:
+        return close
+    first_year = close.index[-1].year - years + 1
+    prior = close[close.index.year < first_year]
+    keep = close[close.index.year >= first_year]
+    return pd.concat([prior.iloc[-1:], keep]) if len(prior) else keep
