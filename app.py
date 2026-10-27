@@ -9,9 +9,11 @@ from plotly.subplots import make_subplots
 from signals.backtest import (
     BacktestParams, SIGNAL_GROUPS, equity_curve, get_signal_events, simulate_trades, summarize_trades,
 )
-from signals.data import load_benchmark_close, load_prices_safe, load_sp500_safe
+from signals.data import load_benchmark_close, load_long_history, load_prices_safe, load_sp500_safe
 from signals.indicators import compute_indicators
 from signals.optimizer import HOLD_GRID, RANK_METRICS, optimize
+from signals.seasonality import (MONTHS, STAT_COLS, month_outlook, month_stats, monthly_returns,
+                                 seasonality_grid, year_totals)
 from signals.summary import (CONDITIONS, GROUPS, PRESETS, add_sector_relative_beta, add_summary,
                              build_table, condition_mask)
 from signals.universes import COUNTRY_ETFS, SECTOR_ETFS
@@ -129,6 +131,107 @@ def build_chart(df, ticker: str, rsi_low: int, rsi_high: int,
     fig.update_layout(height=420 + 180 * n_panels, xaxis_rangeslider_visible=False,
                       margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.05))
     return fig
+
+
+SEASONALITY_YEARS = {"5 years": 5, "10 years": 10, "20 years": 20, "All": None}
+
+
+def _heat(v, cap: float, center: float = 0.0) -> str:
+    """Green/red cell shading, stronger the further v is from center (full at cap)."""
+    if pd.isna(v) or v == center:
+        return ""
+    alpha = 0.08 + 0.6 * min(abs(v - center) / cap, 1.0)
+    rgb = "46,204,113" if v > center else "231,76,60"
+    return f"background-color: rgba({rgb},{alpha:.2f})"
+
+
+def render_seasonality(ticker: str, fallback_df: pd.DataFrame) -> None:
+    st.subheader(f"📅 Seasonality - {ticker}")
+    try:
+        with st.spinner(f"Loading full price history for {ticker}…"):
+            close = load_long_history(ticker)["Close"]
+    except Exception as e:
+        close = fallback_df["Close"]
+        st.caption(f"⚠️ Couldn't load {ticker}'s full history ({e}), so this uses only the "
+                   f"{len(close)} days loaded for the chart above.")
+    rets, partial = monthly_returns(close)
+    if rets.dropna().empty:
+        st.info(f"Not enough history for {ticker} to compute monthly returns.")
+        return
+
+    years_label = st.radio("Years shown", list(SEASONALITY_YEARS), index=1, horizontal=True,
+                           key="season_years")
+    grid = seasonality_grid(rets, SEASONALITY_YEARS[years_label])
+    last = rets.index[-1]
+    partial_cell = (last.year, last.month) if partial else None
+    stats = month_stats(grid, partial_cell)
+
+    # One-line takeaway for the month the data ends in.
+    out = month_outlook(stats, last.month)
+    if out:
+        line = (f"**{out['month']}** has averaged **{out['avg']:+.1%}** for {ticker} "
+                f"(median {out['median']:+.1%}), up in {out['up']} of {out['years']} "
+                f"year{'s' if out['years'] != 1 else ''}.")
+        if partial:
+            line += f" This {out['month']} so far: **{rets.iloc[-1]:+.1%}**."
+        st.markdown(line)
+
+    # Heatmap table: month x year, then per-month stats, with a calendar-year row underneath.
+    year_cols = [str(y) for y in grid.columns]
+    table = grid.set_axis(year_cols, axis=1).join(stats)
+    table.loc["Year"] = pd.concat([year_totals(grid).set_axis(year_cols),
+                                   pd.Series(float("nan"), index=STAT_COLS)])
+    vals = grid.abs().stack()
+    cap = max(float(vals.quantile(0.9)), 0.01) if len(vals) else 0.05
+    totals = table.loc["Year", year_cols].abs().dropna()
+    year_cap = max(float(totals.quantile(0.9)), 0.01) if len(totals) else 0.2
+    # Shade from the numbers but show pre-formatted text, so gaps render blank instead of "None".
+    heat_cols = year_cols + ["Avg", "Median"]
+    css = pd.DataFrame("", index=table.index, columns=table.columns)
+    css.loc[MONTHS, heat_cols] = table.loc[MONTHS, heat_cols].map(lambda v: _heat(v, cap))
+    css.loc["Year", year_cols] = [_heat(v, year_cap) + "; font-weight: bold"
+                                  for v in table.loc["Year", year_cols]]
+    css.loc[MONTHS, "% Up"] = [_heat(v, 0.5, center=0.5) for v in table.loc[MONTHS, "% Up"]]
+    text = pd.DataFrame("", index=table.index, columns=table.columns)
+    for cols, spec in ((heat_cols, "{:+.1%}"), (["% Up"], "{:.0%}"), (["Years"], "{:.0f}")):
+        # Round tiny values to 0 first so they don't print as "-0.0%".
+        text[cols] = table[cols].map(lambda v, spec=spec: "" if pd.isna(v) else
+                                     spec.format(0.0 if abs(v) < 5e-4 else v))
+    if partial_cell and str(partial_cell[0]) in year_cols:
+        text.loc[MONTHS[partial_cell[1] - 1], str(partial_cell[0])] += "*"
+    styled = text.style.apply(lambda _: css, axis=None)
+    st.dataframe(styled, width="stretch", height=35 * (len(table) + 1) + 3)
+    notes = [("Close-to-close % return per calendar month on adjusted prices (splits and "
+              "dividends included). Avg, Median and % Up are over the years shown, using "
+              "completed months only.")]
+    if partial:
+        notes.append(f"{MONTHS[last.month - 1]} {last.year} is month-to-date (marked *).")
+    notes.append("The Year row compounds the months shown in each column, so the first year "
+                 "of data and the current year are partial.")
+    st.caption(" ".join(notes))
+
+    # Average month bar chart, with the median as a marker.
+    colors = ["#2ecc71" if v > 0 else "#e74c3c" for v in stats["Avg"].fillna(0)]
+    custom = list(zip(stats["Median"], stats["% Up"], stats["Years"]))
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=MONTHS, y=stats["Avg"], name="Average", marker_color=colors,
+                         customdata=custom,
+                         hovertemplate="%{x}: avg %{y:+.2%}<br>median %{customdata[0]:+.2%}"
+                                       "<br>up %{customdata[1]:.0%} of %{customdata[2]} years"
+                                       "<extra></extra>"))
+    fig.add_trace(go.Scatter(x=MONTHS, y=stats["Median"], name="Median", mode="markers",
+                             marker=dict(symbol="diamond", size=9, color="#34495e"),
+                             hoverinfo="skip"))
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10),
+                      yaxis=dict(tickformat=".1%", title="Return"),
+                      legend=dict(orientation="h", x=1, xanchor="right", y=1.12),
+                      title=dict(text=f"Average month, {years_label.lower()}", x=0, font=dict(size=14)))
+    fig.add_hline(y=0, line_color="#7f8c8d")
+    st.plotly_chart(fig, width="stretch")
+
+    st.download_button(f"📥 Download {ticker} monthly returns",
+                       table.to_csv(index_label="Month").encode("utf-8"),
+                       file_name=f"{ticker}_monthly_returns.csv", mime="text/csv")
 
 
 # ---------------- Sidebar ----------------
@@ -386,6 +489,8 @@ if rows:
                            df_full.reset_index().rename(columns={"index": "Date"})
                            .to_csv(index=False).encode("utf-8"),
                            file_name=f"{sel}_data.csv", mime="text/csv")
+
+        render_seasonality(sel, df_full)
 
         # ---------------- Backtest ----------------
         with st.expander(f"📊 Backtest a signal on {sel}"):

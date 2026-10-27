@@ -153,3 +153,11 @@ def load_prices_safe(tickers: tuple[str, ...], period: str = "1y"):
         if not prices:
             raise RuntimeError("No matching tickers found in the snapshot either.") from e
         return prices, "fallback", snapshot_asof()
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False, max_entries=50)
+def load_long_history(ticker: str) -> pd.DataFrame:
+    """All available daily history for one ticker, for the seasonality view.
+    Always live (the snapshot only holds a year), and cached for a day since
+    monthly returns barely move intraday. Raises if Yahoo returns nothing."""
+    return fetch_prices((ticker,), "max")[ticker]
