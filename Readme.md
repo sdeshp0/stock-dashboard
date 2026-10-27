@@ -54,8 +54,9 @@ sortable table and a per-ticker drill-down chart.
 - **Seasonality** for the selected ticker (stocks and ETFs alike) - a heatmap table
   of close-to-close monthly returns (months as rows, years as columns) with each
   month's average, median and share of up years, a calendar-year row, a one-line
-  summary of how the current month has usually gone, and an average-month bar
-  chart. It loads the ticker's full history on its own, independent of the
+  summary of how the current month has usually gone, an average-month bar
+  chart, a "typical year" path with the current year overlaid, and
+  turn-of-month and day-of-week return charts. It loads the ticker's full history on its own, independent of the
   History length setting
 - **Backtesting** for the selected ticker - pick any crossover signal, the RSI
   mean-reversion rule, or the overall Bias score, choose direction (long/short/both),
@@ -77,7 +78,7 @@ sortable table and a per-ticker drill-down chart.
 │   ├── summary.py                   # Per-ticker table, signal text, Bias, preset screens
 │   ├── backtest.py                  # Event-based backtest engine (signal -> trade log -> stats)
 │   ├── optimizer.py                 # Per-ticker signal/combination/holding-period sweep
-│   ├── seasonality.py               # Monthly returns, month x year grid, per-month stats
+│   ├── seasonality.py               # Monthly grid + stats, typical-year path, calendar effects
 │   └── universes.py                 # Fixed ETF ticker lists (US sectors, countries)
 ├── scripts/
 │   └── build_snapshot.py            # Builds the offline fallback snapshot (run manually or by CI)
@@ -253,6 +254,26 @@ as fake moves).
 - A one-line **this-month summary** (e.g. "Oct has averaged +0.6% ..., up in 4
   of 9 years") and an **average-month bar chart** (average as bars, median as
   diamonds, win rate on hover) give the quick read. The table downloads as CSV.
+
+Under that, using the same Years shown window:
+
+- **Typical year**: each year's cumulative return since the previous year's
+  last close, by trading day. The blue line is the median across completed
+  years (median, so one extreme year can't reshape it), the shaded band covers
+  the middle half of years, and the current year is drawn on top in orange -
+  so you can see both *when* within a month moves tend to happen and whether
+  this year is tracking its usual shape.
+- **Around month end**: average one-day return for the last five sessions of
+  each month (T-5 .. T-1, T-1 = last day) and the first five of the next
+  (T+1 = first day), against the average of all days. If the data starts
+  mid-month that month is skipped, and the unfinished current month has no
+  "last day" yet, so it only counts towards T+ days.
+- **By weekday**: average one-day return and share of up days, Monday to
+  Friday.
+
+The turn-of-month and weekday effects are well documented historically but
+small next to daily noise and trading costs, and have faded since they became
+widely known; they're descriptive, not trade signals.
 
 With 10 or so data points per month, a month that looks "strong" can easily
 be chance - especially as twelve months are compared at once. Treat it as a

@@ -12,8 +12,9 @@ from signals.backtest import (
 from signals.data import load_benchmark_close, load_long_history, load_prices_safe, load_sp500_safe
 from signals.indicators import compute_indicators
 from signals.optimizer import HOLD_GRID, RANK_METRICS, optimize
-from signals.seasonality import (MONTHS, STAT_COLS, month_outlook, month_stats, monthly_returns,
-                                 seasonality_grid, year_totals)
+from signals.seasonality import (MONTHS, STAT_COLS, last_n_years, month_outlook, month_stats,
+                                 monthly_returns, seasonal_paths, seasonality_grid, turn_of_month,
+                                 typical_path, weekday_stats, year_totals)
 from signals.summary import (CONDITIONS, GROUPS, PRESETS, add_sector_relative_beta, add_summary,
                              build_table, condition_mask)
 from signals.universes import COUNTRY_ETFS, SECTOR_ETFS
@@ -229,9 +230,87 @@ def render_seasonality(ticker: str, fallback_df: pd.DataFrame) -> None:
     fig.add_hline(y=0, line_color="#7f8c8d")
     st.plotly_chart(fig, width="stretch")
 
+    daily = last_n_years(close, SEASONALITY_YEARS[years_label])
+    render_typical_year(daily, ticker, years_label)
+    render_calendar_effects(daily, years_label)
+
     st.download_button(f"📥 Download {ticker} monthly returns",
                        table.to_csv(index_label="Month").encode("utf-8"),
                        file_name=f"{ticker}_monthly_returns.csv", mime="text/csv")
+
+
+def _bar_colors(values) -> list[str]:
+    return ["#2ecc71" if v > 0 else "#e74c3c" for v in pd.Series(values).fillna(0)]
+
+
+def render_typical_year(close: pd.Series, ticker: str, years_label: str) -> None:
+    """Median cumulative path through the year across completed years, with an
+    interquartile band, and the current year drawn on top."""
+    paths = seasonal_paths(close)
+    this_year = close.index[-1].year
+    typ = typical_path(paths, exclude=this_year)
+    # Drop the ragged tail where only a year or two have that many sessions.
+    typ = typ[typ["years"] >= max(2, int(typ["years"].max()) // 2)] if len(typ) else typ
+    if typ.empty:
+        st.caption("Not enough complete years for a typical-year path.")
+        return
+    # Trading day n plotted at the n-th weekday of the current year: close enough to
+    # read months off the axis (holidays shift it by a few days at most).
+    n_days = int(max(typ.index.max(), paths[this_year].count() if this_year in paths else 0))
+    x_of = pd.Series(pd.bdate_range(f"{this_year}-01-01", periods=n_days), index=range(1, n_days + 1))
+    x = x_of[typ.index]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=typ["q75"], line=dict(width=0), hoverinfo="skip",
+                             showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=typ["q25"], line=dict(width=0), fill="tonexty",
+                             fillcolor="rgba(52,152,219,.15)", name="Middle half of years",
+                             hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=x, y=typ["median"], name="Typical year (median)",
+                             line=dict(color="#3498db", width=2), customdata=list(typ.index),
+                             hovertemplate="day %{customdata}: %{y:+.1%}<extra>median</extra>"))
+    if this_year in paths:
+        cur = paths[this_year].dropna()
+        fig.add_trace(go.Scatter(x=x_of[cur.index], y=cur, name=str(this_year),
+                                 line=dict(color="#e67e22", width=2.5), customdata=list(cur.index),
+                                 hovertemplate="day %{customdata}: %{y:+.1%}<extra>"
+                                               f"{this_year}</extra>"))
+    fig.add_hline(y=0, line_color="#7f8c8d")
+    fig.update_layout(height=370, margin=dict(l=10, r=10, t=30, b=10),
+                      yaxis=dict(tickformat=".0%", title="Return since prior year-end"),
+                      xaxis=dict(tickformat="%b", dtick="M1"),
+                      legend=dict(orientation="h", x=0, y=-0.12),
+                      title=dict(text=f"Typical year, {years_label.lower()}", x=0, font=dict(size=14)))
+    st.plotly_chart(fig, width="stretch")
+    st.caption(f"Each year's return since the previous year's last close, by trading day. The "
+               f"blue line is the median across {int(typ['years'].max())} completed years and the "
+               f"band covers the middle half of them; {this_year} is drawn on top.")
+
+
+def render_calendar_effects(close: pd.Series, years_label: str) -> None:
+    """Average daily return around month end, and by weekday."""
+    tom, avg_all = turn_of_month(close)
+    wd = weekday_stats(close)
+    if tom["Days"].fillna(0).sum() == 0:
+        return
+    hover = "%{x}: avg %{y:+.3%}<br>up %{customdata[0]:.0%} of %{customdata[1]} days<extra></extra>"
+    c1, c2 = st.columns(2)
+    for col, stats, title in ((c1, tom, "Around month end"), (c2, wd, "By weekday")):
+        fig = go.Figure(go.Bar(x=list(stats.index), y=stats["Avg"], marker_color=_bar_colors(stats["Avg"]),
+                               customdata=list(zip(stats["% Up"], stats["Days"])),
+                               hovertemplate=hover, showlegend=False))
+        fig.add_hline(y=0, line_color="#7f8c8d")
+        fig.add_hline(y=avg_all, line_dash="dot", line_color="#34495e",
+                      annotation_text="all days", annotation_position="top right")
+        fig.update_layout(height=280, margin=dict(l=10, r=10, t=30, b=10),
+                          yaxis=dict(tickformat=".2%", title="Avg daily return"),
+                          xaxis=dict(type="category"),
+                          title=dict(text=f"{title}, {years_label.lower()}", x=0, font=dict(size=14)))
+        col.plotly_chart(fig, width="stretch")
+    st.caption("Average one-day return. Left: the last five sessions of each month (T-5 to T-1, "
+               "T-1 = last day) and the first five of the next (T+1 = first day). Right: by "
+               "weekday. The dotted line is the average of all days. These effects are small "
+               "next to daily noise and trading costs, and have faded since they became widely "
+               "known - read them as a description of the past, not a signal.")
 
 
 # ---------------- Sidebar ----------------
