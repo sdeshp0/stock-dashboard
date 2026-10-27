@@ -51,6 +51,12 @@ sortable table and a per-ticker drill-down chart.
 - **CSV export** of either the current screener table, or the complete indicator
   history for a single selected ticker (every column, every date) - the same data
   driving its chart
+- **Seasonality** for the selected ticker (stocks and ETFs alike) - a heatmap table
+  of close-to-close monthly returns (months as rows, years as columns) with each
+  month's average, median and share of up years, a calendar-year row, a one-line
+  summary of how the current month has usually gone, and an average-month bar
+  chart. It loads the ticker's full history on its own, independent of the
+  History length setting
 - **Backtesting** for the selected ticker - pick any crossover signal, the RSI
   mean-reversion rule, or the overall Bias score, choose direction (long/short/both),
   an exit rule (fixed holding period or until the opposite signal fires, with the
@@ -71,6 +77,7 @@ sortable table and a per-ticker drill-down chart.
 │   ├── summary.py                   # Per-ticker table, signal text, Bias, preset screens
 │   ├── backtest.py                  # Event-based backtest engine (signal -> trade log -> stats)
 │   ├── optimizer.py                 # Per-ticker signal/combination/holding-period sweep
+│   ├── seasonality.py               # Monthly returns, month x year grid, per-month stats
 │   └── universes.py                 # Fixed ETF ticker lists (US sectors, countries)
 ├── scripts/
 │   └── build_snapshot.py            # Builds the offline fallback snapshot (run manually or by CI)
@@ -220,6 +227,36 @@ avoids most live downloads and what it falls back to.
   adjustment approaches discussed (beta vs. a sector index instead of SPY,
   peer-relative beta, or Vasicek-style shrinkage toward the sector mean),
   this is the peer-relative version - the other two remain unimplemented.
+
+## Seasonality
+
+Below the chart for the selected ticker is a seasonality section built from
+**monthly close-to-close returns**: each month's last close vs the previous
+month's last close, on adjusted prices (so splits and dividends don't show up
+as fake moves).
+
+- **Full history, one ticker**: the section fetches all available daily history
+  (`period="max"`) for just the selected ticker, cached for 24 hours, so it
+  works the same whatever History length is picked in the sidebar and for any
+  ticker - S&P 500 stocks, the sector and country ETFs, or a custom list. If
+  that fetch fails it falls back to the history already loaded for the chart
+  and says so (with the 1-year default that's only one year of months).
+- **Heatmap table**: months as rows, calendar years as columns (last 5, 10, 20
+  years, or all), shaded green/red by size. To the right, each month's
+  **Avg**, **Median**, **% Up** (share of years it rose) and **Years** (how
+  many years of data that is). A **Year** row underneath compounds each
+  column's months into a calendar-year return.
+- The **current month** is shown month-to-date (marked `*`) but is left out of
+  Avg / Median / % Up, so a half-finished month doesn't skew them. The first
+  month of data has no prior close, so it has no return; the first year and the
+  current year are therefore partial in the Year row.
+- A one-line **this-month summary** (e.g. "Oct has averaged +0.6% ..., up in 4
+  of 9 years") and an **average-month bar chart** (average as bars, median as
+  diamonds, win rate on hover) give the quick read. The table downloads as CSV.
+
+With 10 or so data points per month, a month that looks "strong" can easily
+be chance - especially as twelve months are compared at once. Treat it as a
+starting point for a question, not a signal on its own.
 
 ## Backtesting
 
