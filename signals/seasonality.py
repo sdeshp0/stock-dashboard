@@ -166,3 +166,163 @@ def last_n_years(close: pd.Series, years: int | None) -> pd.Series:
     prior = close[close.index.year < first_year]
     keep = close[close.index.year >= first_year]
     return pd.concat([prior.iloc[-1:], keep]) if len(prior) else keep
+
+
+# ---- Forward outlook from today's calendar date ----
+
+FORWARD_HORIZONS = (5, 10, 20, 60)  # trading sessions
+
+
+def forward_from_date(close: pd.Series, horizons=FORWARD_HORIZONS,
+                      as_of: pd.Timestamp | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """How the next `h` sessions went in past years, starting from the same
+    calendar date as `as_of` (default: the last bar). Each year enters at the
+    close of its last session on or before that date - like buying at today's
+    close - and the current year is left out, since its window hasn't happened.
+    Returns (by_year: years x horizons, summary: horizons x stats)."""
+    close = close.dropna()
+    cols = [f"{h}d" for h in horizons]
+    if close.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=FORWARD_STATS)
+    as_of = as_of or close.index[-1]
+    idx, vals = close.index, close.to_numpy()
+    rows = {}
+    for year in sorted(set(idx.year)):
+        if year >= as_of.year:
+            continue
+        day = min(as_of.day, 28) if as_of.month == 2 else as_of.day  # Feb 29 -> 28
+        anchor = pd.Timestamp(year=year, month=as_of.month, day=day)
+        pos = idx.searchsorted(anchor, side="right") - 1
+        if pos < 0 or anchor - idx[pos] > pd.Timedelta(days=7):
+            continue  # data starts after this date (or a long gap before it)
+        rows[year] = [vals[pos + h] / vals[pos] - 1 if pos + h < len(vals) else float("nan")
+                      for h in horizons]
+    by_year = pd.DataFrame.from_dict(rows, orient="index", columns=cols)
+    by_year.index.name = "Year"
+    return by_year, summarize_returns(by_year)
+
+
+FORWARD_STATS = ["Avg", "Median", "% Up", "Best", "Worst", "Years"]
+
+
+def summarize_returns(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-column Avg / Median / % Up / Best / Worst / Years, one row per column."""
+    return pd.DataFrame({"Avg": df.mean(), "Median": df.median(),
+                         "% Up": (df > 0).sum() / df.count(), "Best": df.max(),
+                         "Worst": df.min(), "Years": df.count()})[FORWARD_STATS]
+
+
+# ---- Event windows ----
+
+EVENT_ORDER = ["Day before a holiday", "Day after a holiday", "Options-expiry week",
+               "Week after options expiry", "Quarter's last 5 days", "Quarter's first 5 days",
+               "All days"]
+
+
+def third_friday(year: int, month: int) -> pd.Timestamp:
+    first = pd.Timestamp(year=year, month=month, day=1)
+    return first + pd.Timedelta(days=(4 - first.dayofweek) % 7 + 14)
+
+
+def event_flags(close: pd.Series) -> pd.DataFrame:
+    """Daily returns (as in _daily) flagged with the calendar event each session
+    falls in. Market holidays are read from the data itself: a weekday with no
+    session between two sessions is taken as a holiday. Options expiry is the
+    third Friday of the month (the session before it if that Friday is a holiday)."""
+    df = _daily(close)
+    if df.empty:
+        return df
+    sessions = close.dropna().index
+    have = set(sessions)
+    first, last = sessions[0], sessions[-1]
+    nxt = df.index + pd.offsets.BDay(1)
+    prv = df.index - pd.offsets.BDay(1)
+    df["pre_holiday"] = [(n not in have) and n < last for n in nxt]
+    df["post_holiday"] = [(p not in have) and p > first for p in prv]
+
+    # Options expiry sessions, then the Mon-Fri week each one falls in.
+    opex = []
+    for p in pd.period_range(first, last, freq="M"):
+        tf = third_friday(p.year, p.month)
+        pos = sessions.searchsorted(tf, side="right") - 1
+        if pos >= 0 and tf - sessions[pos] < pd.Timedelta(days=4):
+            opex.append(sessions[pos])
+    week = df.index.to_period("W-FRI")
+    opex_weeks = {d.to_period("W-FRI") for d in opex}
+    df["opex_week"] = week.isin(opex_weeks)
+    df["post_opex_week"] = week.isin({w + 1 for w in opex_weeks})
+
+    q_end = df.index.month.isin([3, 6, 9, 12])
+    df["quarter_end"] = q_end & (df["from_end"] >= -5).fillna(False).to_numpy(dtype=bool)
+    df["quarter_start"] = df.index.month.isin([1, 4, 7, 10]) & (df["from_start"] <= 5)
+    return df
+
+
+def event_windows(close: pd.Series) -> pd.DataFrame:
+    """Avg daily return, % Up and Days for each calendar event, plus all days."""
+    df = event_flags(close)
+    if df.empty:
+        return pd.DataFrame(columns=["Avg", "% Up", "Days"])
+    groups = {"Day before a holiday": "pre_holiday", "Day after a holiday": "post_holiday",
+              "Options-expiry week": "opex_week", "Week after options expiry": "post_opex_week",
+              "Quarter's last 5 days": "quarter_end", "Quarter's first 5 days": "quarter_start"}
+    out = {}
+    for label, col in groups.items():
+        r = df.loc[df[col], "ret"]
+        out[label] = {"Avg": r.mean(), "% Up": (r > 0).mean() if len(r) else float("nan"),
+                      "Days": len(r)}
+    out["All days"] = {"Avg": df["ret"].mean(), "% Up": (df["ret"] > 0).mean(), "Days": len(df)}
+    return pd.DataFrame.from_dict(out, orient="index").loc[EVENT_ORDER]
+
+
+def earnings_reaction_day(sessions: pd.DatetimeIndex, when: pd.Timestamp) -> pd.Timestamp | None:
+    """The session that first trades on an earnings release at local time
+    `when`: a release from noon on (after the close) is traded the next
+    session, an earlier one (before the open) the same day."""
+    day = when.normalize()
+    pos = sessions.searchsorted(day, side="right" if when.hour >= 12 else "left")
+    return sessions[pos] if pos < len(sessions) else None
+
+
+def earnings_moves(close: pd.Series, release_times, pre: int = 5,
+                   post: int = 20) -> pd.DataFrame:
+    """One row per past earnings release: the `pre` sessions before the
+    reaction day, the reaction day itself (close-to-close), and the `post`
+    sessions after it. Windows that run past the data are NaN."""
+    close = close.dropna()
+    idx, vals = close.index, close.to_numpy()
+    rows = {}
+    for when in sorted(release_times):
+        day = earnings_reaction_day(idx, when)
+        if day is None:
+            continue
+        r = idx.get_loc(day)
+        if r - 1 - pre < 0:
+            continue
+        rows[day] = {
+            f"{pre} days before": vals[r - 1] / vals[r - 1 - pre] - 1,
+            "Reaction day": vals[r] / vals[r - 1] - 1,
+            f"{post} days after": vals[r + post] / vals[r] - 1 if r + post < len(vals) else float("nan"),
+        }
+    out = pd.DataFrame.from_dict(rows, orient="index")
+    out.index.name = "Reaction day"
+    return out
+
+
+# ---- Cross-ticker calendar ----
+
+def month_avg_row(close: pd.Series, years: int | None,
+                  benchmark: pd.Series | None = None) -> pd.Series:
+    """Average return for each calendar month (completed months, last `years`
+    calendar years) - in excess of the benchmark's return in the same month
+    when one is given. Indexed Jan..Dec, plus 'Years' (most years any month has)."""
+    rets, partial = monthly_returns(close)
+    if benchmark is not None:
+        b, _ = monthly_returns(benchmark)
+        rets = (rets - b).dropna()
+    if rets.empty:
+        return pd.Series(float("nan"), index=MONTHS + ["Years"])
+    grid = seasonality_grid(rets, years)
+    last = rets.index[-1]
+    stats = month_stats(grid, (last.year, last.month) if partial else None)
+    return pd.concat([stats["Avg"], pd.Series({"Years": stats["Years"].max()})])

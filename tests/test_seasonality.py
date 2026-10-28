@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from signals.seasonality import (MONTHS, WEEKDAYS, last_n_years, month_outlook, month_stats,
-                                 monthly_returns, seasonal_paths, seasonality_grid, turn_of_month,
+from signals.seasonality import (MONTHS, WEEKDAYS, earnings_moves, earnings_reaction_day,
+                                 event_flags, event_windows, forward_from_date, last_n_years,
+                                 month_avg_row, month_outlook, month_stats, monthly_returns,
+                                 seasonal_paths, seasonality_grid, third_friday, turn_of_month,
                                  typical_path, weekday_stats, year_totals)
 
 
@@ -150,3 +152,79 @@ def test_last_n_years_keeps_prior_year_end_base():
     assert t.index[0] == pd.Timestamp("2022-12-30")
     assert t.index[1] == pd.Timestamp("2023-01-02")
     assert last_n_years(s, None).equals(s)
+
+
+def test_forward_from_date_enters_on_or_before_same_date():
+    # Oct 28 2023 is a Saturday -> enter at Fri Oct 27's close; 2024 enters Mon Oct 28.
+    s = _daily_closes("2022-12-30", "2025-10-28", {"2023-10-30": 0.10, "2024-10-29": -0.05})
+    by_year, summary = forward_from_date(s, horizons=(1, 5))
+    assert list(by_year.index) == [2023, 2024]  # 2025 is the as-of year: excluded
+    assert by_year.loc[2023, "1d"] == pytest.approx(0.10)
+    assert by_year.loc[2024, "1d"] == pytest.approx(-0.05)
+    assert summary.loc["1d", "% Up"] == pytest.approx(0.5)
+    assert summary.loc["5d", "Worst"] == pytest.approx(-0.05)
+    assert summary.loc["1d", "Years"] == 2
+
+
+def test_forward_from_date_skips_years_before_data():
+    s = _daily_closes("2024-11-15", "2025-10-28")
+    by_year, _ = forward_from_date(s, horizons=(5,))
+    assert by_year.empty  # data starts after Oct 28 2024
+
+
+def test_third_friday():
+    assert third_friday(2024, 3) == pd.Timestamp("2024-03-15")
+    assert third_friday(2024, 11) == pd.Timestamp("2024-11-15")
+    assert third_friday(2026, 5) == pd.Timestamp("2026-05-15")
+
+
+def test_event_flags_holidays_and_opex():
+    s = _daily_closes("2024-06-28", "2024-07-31")
+    s = s.drop(pd.Timestamp("2024-07-04"))  # Independence Day
+    df = event_flags(s)
+    assert df.loc["2024-07-03", "pre_holiday"]
+    assert df.loc["2024-07-05", "post_holiday"]
+    assert df["pre_holiday"].sum() == 1  # Jul 31 is the last bar, not a holiday
+    assert df.loc["2024-07-15":"2024-07-19", "opex_week"].all()  # Jul 19 = 3rd Friday
+    assert not df.loc["2024-07-22", "opex_week"]
+    assert df.loc["2024-07-22":"2024-07-26", "post_opex_week"].all()
+
+
+def test_event_windows_quarter_and_all_days():
+    s = _daily_closes("2024-05-31", "2024-07-31", {"2024-06-28": 0.02, "2024-07-01": 0.01})
+    ev = event_windows(s)
+    assert ev.loc["Quarter's last 5 days", "Days"] == 5
+    assert ev.loc["Quarter's last 5 days", "Avg"] == pytest.approx(0.02 / 5)
+    assert ev.loc["Quarter's first 5 days", "Avg"] == pytest.approx(0.01 / 5)
+    assert ev.index[-1] == "All days"
+
+
+def test_earnings_reaction_day():
+    sessions = pd.bdate_range("2024-04-22", "2024-04-30")
+    assert earnings_reaction_day(sessions, pd.Timestamp("2024-04-25 16:30")) == pd.Timestamp("2024-04-26")
+    assert earnings_reaction_day(sessions, pd.Timestamp("2024-04-25 07:00")) == pd.Timestamp("2024-04-25")
+    assert earnings_reaction_day(sessions, pd.Timestamp("2024-04-26 16:30")) == pd.Timestamp("2024-04-29")
+    assert earnings_reaction_day(sessions, pd.Timestamp("2024-04-30 16:30")) is None
+
+
+def test_earnings_moves_windows():
+    s = _daily_closes("2024-03-01", "2024-05-31", {"2024-04-22": 0.05, "2024-04-26": 0.08,
+                                                   "2024-05-06": -0.02})
+    moves = earnings_moves(s, [pd.Timestamp("2024-04-25 16:05")], pre=5, post=20)
+    row = moves.loc[pd.Timestamp("2024-04-26")]
+    assert row["Reaction day"] == pytest.approx(0.08)
+    assert row["5 days before"] == pytest.approx(0.05)  # Apr 18 close -> Apr 25 close
+    assert row["20 days after"] == pytest.approx(-0.02)
+    late = earnings_moves(s, [pd.Timestamp("2024-05-20 16:05")], pre=5, post=20)
+    assert np.isnan(late.iloc[0]["20 days after"])
+
+
+def test_month_avg_row_vs_benchmark():
+    s = _closes({"2023-12": 100, "2024-01": 110, "2024-02": 110})
+    b = _closes({"2023-12": 100, "2024-01": 105, "2024-02": 115.5})
+    raw = month_avg_row(s, None)
+    rel = month_avg_row(s, None, benchmark=b)
+    assert raw["Jan"] == pytest.approx(0.10)
+    assert rel["Jan"] == pytest.approx(0.05)
+    assert rel["Feb"] == pytest.approx(-0.10)
+    assert rel["Years"] == 1
