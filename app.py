@@ -410,8 +410,16 @@ def render_event_windows(close: pd.Series, ticker: str, years_label: str) -> Non
         return  # ETFs and anything else without an earnings calendar
     st.markdown("**Around earnings**")
     c1, c2 = st.columns(2)
-    pre = c1.radio("Days before", EARNINGS_PRE, index=1, horizontal=True, key="season_earn_pre")
-    post = c2.radio("Days after", EARNINGS_POST, index=1, horizontal=True, key="season_earn_post")
+    pre = c1.radio("Days before", EARNINGS_PRE, index=1, horizontal=True, key="season_earn_pre",
+                   help="The pre-earnings run-up, as positioning builds ahead of the report. "
+                        "1 = the day before only; 5 (default) = the final trading week, where "
+                        "most of the run-up happens; 10 = two weeks, which starts to pick up "
+                        "unrelated market moves.")
+    post = c2.radio("Days after", EARNINGS_POST, index=1, horizontal=True, key="season_earn_post",
+                    help="Post-earnings drift: the documented tendency to keep moving in the "
+                         "direction of the surprise for weeks. 5 = the immediate follow-through; "
+                         "20 (default) = about a month, where most of the drift shows up; 60 = "
+                         "about a quarter, which starts to overlap the next report's run-up.")
     moves = earnings_moves(close, dates, pre=pre, post=post)
     if moves.empty:
         st.caption("No earnings releases within the years shown.")
@@ -431,7 +439,9 @@ def render_event_windows(close: pd.Series, ticker: str, years_label: str) -> Non
                      width="stretch")
     st.caption("The reaction day is the first session to trade on the release (the same day for a "
                "release before the open, the next day for one after the close). 'Days before' runs "
-               "up to the close before it, 'days after' from its close.")
+               "up to the close before it, 'days after' from its close. The window after is "
+               "longer on purpose: drift after a report is the larger, better-documented effect, "
+               "while the run-up before it is short.")
 
 
 def render_sector_calendar() -> None:
