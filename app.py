@@ -348,8 +348,10 @@ def render_forward_outlook(close: pd.Series, ticker: str) -> None:
     by_year, summary = forward_from_date(close)
     if by_year.empty:
         return
+    # Built by hand: strftime's "%-d" (no leading zero) is Linux/macOS-only and fails on Windows.
     as_of = close.index[-1]
-    st.markdown(f"**From {as_of:%b %-d}: how the next few weeks went in past years**")
+    date = f"{as_of:%b} {as_of.day}"
+    st.markdown(f"**From {date}: how the next few weeks went in past years**")
     summary.index = [f"Next {h} days" for h in FORWARD_HORIZONS]
     ret_cols = ["Avg", "Median", "Best", "Worst"]
     cap = _cap(summary[ret_cols], 0.01)
@@ -364,7 +366,7 @@ def render_forward_outlook(close: pd.Series, ticker: str) -> None:
                                  {c: (_cap(yr[c], 0.01), 0.0) for c in yr.columns}),
                      width="stretch")
     st.caption(f"Each past year enters at the close of its last session on or before "
-               f"{as_of:%b %-d} and holds for that many trading sessions. 'Best' and 'Worst' "
+               f"{date} and holds for that many trading sessions. 'Best' and 'Worst' "
                f"are the single best and worst years, which says more about risk than the average.")
 
 
