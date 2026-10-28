@@ -297,10 +297,12 @@ Aimed more directly at timing a trade:
   the third Friday) and the week after it, and in the last and first five
   sessions of each quarter - shaded against the all-days average.
 - **Around earnings** (stocks only - ETFs have no earnings calendar and the
-  block is skipped): for each past release in range, the 5 sessions before,
-  the reaction day (the first session to trade on it: the same day for a
-  release before the open, the next for one after the close), and the 20
-  sessions after.
+  block is skipped): for each past release in range, the sessions before it
+  (1, 5 or 10 - the run-up), the reaction day (the first session to trade on
+  it: the same day for a release before the open, the next for one after the
+  close), and the sessions after it (5, 20 or 60 - post-earnings drift).
+  Defaults are 5 before and 20 after; 60 after starts to overlap the next
+  quarter's run-up.
 
 ## Sector rotation calendar
 

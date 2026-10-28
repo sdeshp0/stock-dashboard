@@ -138,6 +138,8 @@ def build_chart(df, ticker: str, rsi_low: int, rsi_high: int,
     return fig
 
 
+EARNINGS_PRE = [1, 5, 10]    # sessions before the reaction day (run-up)
+EARNINGS_POST = [5, 20, 60]  # sessions after it (post-earnings drift)
 SEASONALITY_YEARS = {"5 years": 5, "10 years": 10, "20 years": 20, "All": None}
 
 
@@ -404,10 +406,16 @@ def render_event_windows(close: pd.Series, ticker: str, years_label: str) -> Non
     if dates is None:
         st.caption(f"Couldn't load earnings dates for {ticker} right now.")
         return
-    moves = earnings_moves(close, dates)
-    if moves.empty:
+    if not dates:
         return  # ETFs and anything else without an earnings calendar
-    st.markdown(f"**Around earnings, last {len(moves)} releases in range**")
+    st.markdown("**Around earnings**")
+    c1, c2 = st.columns(2)
+    pre = c1.radio("Days before", EARNINGS_PRE, index=1, horizontal=True, key="season_earn_pre")
+    post = c2.radio("Days after", EARNINGS_POST, index=1, horizontal=True, key="season_earn_post")
+    moves = earnings_moves(close, dates, pre=pre, post=post)
+    if moves.empty:
+        st.caption("No earnings releases within the years shown.")
+        return
     summ = summarize_returns(moves).rename(columns={"Years": "Releases"})
     ret_cols = ["Avg", "Median", "Best", "Worst"]
     st.dataframe(_heat_frame(summ, {**{c: "{:+.1%}" for c in ret_cols}, "% Up": "{:.0%}",
