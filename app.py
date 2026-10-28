@@ -9,12 +9,16 @@ from plotly.subplots import make_subplots
 from signals.backtest import (
     BacktestParams, SIGNAL_GROUPS, equity_curve, get_signal_events, simulate_trades, summarize_trades,
 )
-from signals.data import load_benchmark_close, load_long_history, load_prices_safe, load_sp500_safe
+from signals.data import (load_benchmark_close, load_earnings_dates, load_long_histories, load_long_history,
+                          load_prices_safe, load_sp500_safe)
+from signals.data_core import BENCHMARK_TICKER
 from signals.indicators import compute_indicators
 from signals.optimizer import HOLD_GRID, RANK_METRICS, optimize
-from signals.seasonality import (MONTHS, STAT_COLS, last_n_years, month_outlook, month_stats,
-                                 monthly_returns, seasonal_paths, seasonality_grid, turn_of_month,
-                                 typical_path, weekday_stats, year_totals)
+from signals.seasonality import (FORWARD_HORIZONS, MONTHS, STAT_COLS, earnings_moves, event_windows,
+                                 forward_from_date, last_n_years, month_avg_row, month_outlook,
+                                 month_stats, monthly_returns, seasonal_paths, seasonality_grid,
+                                 summarize_returns, turn_of_month, typical_path, weekday_stats,
+                                 year_totals)
 from signals.summary import (CONDITIONS, GROUPS, PRESETS, add_sector_relative_beta, add_summary,
                              build_table, condition_mask)
 from signals.universes import COUNTRY_ETFS, SECTOR_ETFS
@@ -134,6 +138,8 @@ def build_chart(df, ticker: str, rsi_low: int, rsi_high: int,
     return fig
 
 
+EARNINGS_PRE = [1, 5, 10]    # sessions before the reaction day (run-up)
+EARNINGS_POST = [5, 20, 60]  # sessions after it (post-earnings drift)
 SEASONALITY_YEARS = {"5 years": 5, "10 years": 10, "20 years": 20, "All": None}
 
 
@@ -147,7 +153,6 @@ def _heat(v, cap: float, center: float = 0.0) -> str:
 
 
 def render_seasonality(ticker: str, fallback_df: pd.DataFrame) -> None:
-    st.subheader(f"📅 Seasonality - {ticker}")
     try:
         with st.spinner(f"Loading full price history for {ticker}…"):
             close = load_long_history(ticker)["Close"]
@@ -176,6 +181,8 @@ def render_seasonality(ticker: str, fallback_df: pd.DataFrame) -> None:
         if partial:
             line += f" This {out['month']} so far: **{rets.iloc[-1]:+.1%}**."
         st.markdown(line)
+    daily = last_n_years(close, SEASONALITY_YEARS[years_label])
+    render_forward_outlook(daily, ticker)
 
     # Heatmap table: month x year, then per-month stats, with a calendar-year row underneath.
     year_cols = [str(y) for y in grid.columns]
@@ -230,9 +237,9 @@ def render_seasonality(ticker: str, fallback_df: pd.DataFrame) -> None:
     fig.add_hline(y=0, line_color="#7f8c8d")
     st.plotly_chart(fig, width="stretch")
 
-    daily = last_n_years(close, SEASONALITY_YEARS[years_label])
     render_typical_year(daily, ticker, years_label)
     render_calendar_effects(daily, years_label)
+    render_event_windows(daily, ticker, years_label)
 
     st.download_button(f"📥 Download {ticker} monthly returns",
                        table.to_csv(index_label="Month").encode("utf-8"),
@@ -311,6 +318,176 @@ def render_calendar_effects(close: pd.Series, years_label: str) -> None:
                "weekday. The dotted line is the average of all days. These effects are small "
                "next to daily noise and trading costs, and have faded since they became widely "
                "known - read them as a description of the past, not a signal.")
+
+
+def _fmt(v, spec: str) -> str:
+    """Blank for NaN, and a value that rounds to zero prints as zero, not '-0.0%'."""
+    if pd.isna(v):
+        return ""
+    out, zero = spec.format(v), spec.format(0.0)
+    return zero if out.lstrip("+-") == zero.lstrip("+-") else out
+
+
+def _heat_frame(values: pd.DataFrame, specs: dict[str, str], heat: dict[str, tuple[float, float]]):
+    """Pre-formatted text (blank for NaN) with green/red shading from the
+    numbers. `specs` maps column -> format, `heat` maps column -> (cap, center)."""
+    text = pd.DataFrame("", index=values.index, columns=values.columns)
+    css = pd.DataFrame("", index=values.index, columns=values.columns)
+    for c, spec in specs.items():
+        text[c] = values[c].map(lambda v, spec=spec: _fmt(v, spec))
+    for c, (cap, center) in heat.items():
+        css[c] = [_heat(v, cap, center) for v in values[c]]
+    return text.style.apply(lambda _: css, axis=None)
+
+
+def _cap(values, floor: float) -> float:
+    vals = pd.DataFrame(values).abs().stack().dropna()
+    return max(float(vals.quantile(0.9)), floor) if len(vals) else floor
+
+
+def render_forward_outlook(close: pd.Series, ticker: str) -> None:
+    """How the next 5/10/20/60 sessions went in past years from today's date."""
+    by_year, summary = forward_from_date(close)
+    if by_year.empty:
+        return
+    # Built by hand: strftime's "%-d" (no leading zero) is Linux/macOS-only and fails on Windows.
+    as_of = close.index[-1]
+    date = f"{as_of:%b} {as_of.day}"
+    st.markdown(f"**From {date}: how the next few weeks went in past years**")
+    summary.index = [f"Next {h} days" for h in FORWARD_HORIZONS]
+    ret_cols = ["Avg", "Median", "Best", "Worst"]
+    cap = _cap(summary[ret_cols], 0.01)
+    st.dataframe(_heat_frame(summary, {**{c: "{:+.1%}" for c in ret_cols}, "% Up": "{:.0%}",
+                                       "Years": "{:.0f}"},
+                             {**{c: (cap, 0.0) for c in ret_cols}, "% Up": (0.5, 0.5)}),
+                 width="stretch", height=35 * (len(summary) + 1) + 3)
+    if st.toggle("Show each year", key="season_fwd_years"):
+        yr = by_year.sort_index(ascending=False)
+        yr.index = yr.index.astype(str)
+        st.dataframe(_heat_frame(yr, dict.fromkeys(yr.columns, "{:+.1%}"),
+                                 {c: (_cap(yr[c], 0.01), 0.0) for c in yr.columns}),
+                     width="stretch")
+    st.caption(f"Each past year enters at the close of its last session on or before "
+               f"{date} and holds for that many trading sessions. 'Best' and 'Worst' "
+               f"are the single best and worst years, which says more about risk than the average.")
+
+
+def render_event_windows(close: pd.Series, ticker: str, years_label: str) -> None:
+    """Average daily return around recurring calendar events, and around
+    earnings releases for tickers that have them."""
+    ev = event_windows(close)
+    ev = ev[ev["Days"] > 0]  # e.g. no holidays inside a short history
+    if len(ev) < 2:
+        return
+    st.markdown(f"**Around recurring events, {years_label.lower()}**")
+    all_avg = ev.loc["All days", "Avg"]
+    c1, c2 = st.columns([3, 2])
+    fig = go.Figure(go.Bar(y=list(ev.index[:-1])[::-1], x=ev["Avg"].iloc[:-1][::-1], orientation="h",
+                           marker_color=_bar_colors(ev["Avg"].iloc[:-1][::-1]),
+                           customdata=list(zip(ev["% Up"].iloc[:-1][::-1], ev["Days"].iloc[:-1][::-1])),
+                           hovertemplate="%{y}: avg %{x:+.3%}<br>up %{customdata[0]:.0%} of "
+                                         "%{customdata[1]} days<extra></extra>"))
+    fig.add_vline(x=0, line_color="#7f8c8d")
+    fig.add_vline(x=all_avg, line_dash="dot", line_color="#34495e",
+                  annotation_text="all days", annotation_position="top")
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10),
+                      xaxis=dict(tickformat=".2%", title="Avg daily return"))
+    c1.plotly_chart(fig, width="stretch")
+    # Shaded relative to the all-days row, which (being the center) stays unshaded.
+    c2.dataframe(_heat_frame(ev, {"Avg": "{:+.3%}", "% Up": "{:.0%}", "Days": "{:.0f}"},
+                             {"Avg": (_cap(ev["Avg"] - all_avg, 0.0005), all_avg),
+                              "% Up": (0.1, ev.loc["All days", "% Up"])}),
+                 width="stretch", height=35 * (len(ev) + 1) + 3)
+    st.caption("Average one-day return on sessions in each window. Holidays are read from the "
+               "price data (a weekday with no trading between two sessions). Options expiry is the "
+               "third Friday of each month; its week is that Monday to Friday.")
+
+    dates = load_earnings_dates(ticker)
+    if dates is None:
+        st.caption(f"Couldn't load earnings dates for {ticker} right now.")
+        return
+    if not dates:
+        return  # ETFs and anything else without an earnings calendar
+    st.markdown("**Around earnings**")
+    c1, c2 = st.columns(2)
+    pre = c1.radio("Days before", EARNINGS_PRE, index=1, horizontal=True, key="season_earn_pre",
+                   help="The pre-earnings run-up, as positioning builds ahead of the report. "
+                        "1 = the day before only; 5 (default) = the final trading week, where "
+                        "most of the run-up happens; 10 = two weeks, which starts to pick up "
+                        "unrelated market moves.")
+    post = c2.radio("Days after", EARNINGS_POST, index=1, horizontal=True, key="season_earn_post",
+                    help="Post-earnings drift: the documented tendency to keep moving in the "
+                         "direction of the surprise for weeks. 5 = the immediate follow-through; "
+                         "20 (default) = about a month, where most of the drift shows up; 60 = "
+                         "about a quarter, which starts to overlap the next report's run-up.")
+    moves = earnings_moves(close, dates, pre=pre, post=post)
+    if moves.empty:
+        st.caption("No earnings releases within the years shown.")
+        return
+    summ = summarize_returns(moves).rename(columns={"Years": "Releases"})
+    ret_cols = ["Avg", "Median", "Best", "Worst"]
+    st.dataframe(_heat_frame(summ, {**{c: "{:+.1%}" for c in ret_cols}, "% Up": "{:.0%}",
+                                    "Releases": "{:.0f}"},
+                             {**{c: (_cap(summ[ret_cols], 0.01), 0.0) for c in ret_cols},
+                              "% Up": (0.5, 0.5)}),
+                 width="stretch", height=35 * (len(summ) + 1) + 3)
+    if st.toggle("Show each release", key="season_earn_each"):
+        each = moves.sort_index(ascending=False)
+        each.index = each.index.strftime("%Y-%m-%d")
+        st.dataframe(_heat_frame(each, dict.fromkeys(each.columns, "{:+.1%}"),
+                                 {c: (_cap(each[c], 0.01), 0.0) for c in each.columns}),
+                     width="stretch")
+    st.caption("The reaction day is the first session to trade on the release (the same day for a "
+               "release before the open, the next day for one after the close). 'Days before' runs "
+               "up to the close before it, 'days after' from its close. The window after is "
+               "longer on purpose: drift after a report is the larger, better-documented effect, "
+               "while the run-up before it is short.")
+
+
+def render_sector_calendar() -> None:
+    """Average return by calendar month for each sector ETF, raw or vs SPY."""
+    st.caption("Average return in each calendar month for the sector ETFs, to see which have "
+               "tended to lead at each point in the year.")
+    c1, c2 = st.columns(2)
+    years_label = c1.radio("Years", list(SEASONALITY_YEARS), index=1, horizontal=True,
+                           key="sector_cal_years")
+    vs_spy = c2.radio("Show", ["Raw return", "vs SPY"], horizontal=True, key="sector_cal_mode") == "vs SPY"
+    tickers = tuple(sorted(SECTOR_ETFS)) + (BENCHMARK_TICKER,)
+    try:
+        with st.spinner("Loading sector ETF history…"):
+            hist = load_long_histories(tickers)
+    except Exception as e:
+        st.error(f"Couldn't load sector ETF history: {e}")
+        return
+    bench = hist[BENCHMARK_TICKER]["Close"] if BENCHMARK_TICKER in hist else None
+    if vs_spy and bench is None:
+        st.warning("SPY history unavailable, so showing raw returns.")
+        vs_spy = False
+    rows = {f"{t} {SECTOR_ETFS[t]}": month_avg_row(hist[t]["Close"], SEASONALITY_YEARS[years_label],
+                                                   bench if vs_spy else None)
+            for t in sorted(SECTOR_ETFS) if t in hist}
+    if not rows:
+        st.info("No sector ETF history came back.")
+        return
+    table = pd.DataFrame(rows).T
+    if not vs_spy and bench is not None:
+        table.loc[f"{BENCHMARK_TICKER} S&P 500"] = month_avg_row(bench, SEASONALITY_YEARS[years_label])
+    last = max(h.index[-1] for h in hist.values())
+    now, nxt = MONTHS[last.month - 1], MONTHS[last.month % 12]
+    st.dataframe(_heat_frame(table, {**dict.fromkeys(MONTHS, "{:+.1%}"), "Years": "{:.0f}"},
+                             {m: (_cap(table[MONTHS], 0.005), 0.0) for m in MONTHS})
+                 .set_properties(subset=[now, nxt], **{"font-weight": "bold"}),
+                 width="stretch", height=35 * (len(table) + 1) + 3)
+    ranked = table[nxt].dropna().sort_values(ascending=False)
+    if len(ranked) >= 3:
+        what = "vs SPY" if vs_spy else "on average"
+        st.markdown(f"Historically strongest in **{nxt}** ({what}): "
+                    + ", ".join(f"{k.split()[0]} {v:+.1%}" for k, v in ranked.head(3).items())
+                    + ". Weakest: "
+                    + ", ".join(f"{k.split()[0]} {v:+.1%}" for k, v in ranked.tail(3)[::-1].items()) + ".")
+    st.caption(f"{'Each ETF minus SPY in the same month' if vs_spy else 'Raw monthly returns'}, "
+               f"averaged over completed months in the {years_label.lower()} window; {now} and {nxt} "
+               "are in bold. Years = most years any month has (XLRE and XLC are younger funds).")
 
 
 # ---------------- Sidebar ----------------
@@ -569,7 +746,11 @@ if rows:
                            .to_csv(index=False).encode("utf-8"),
                            file_name=f"{sel}_data.csv", mime="text/csv")
 
-        render_seasonality(sel, df_full)
+        # Expensive (full-history download), so only built while the expander is open.
+        season = st.expander(f"📅 Seasonality for {sel}", key="season_exp", on_change="rerun")
+        with season:
+            if season.open:
+                render_seasonality(sel, df_full)
 
         # ---------------- Backtest ----------------
         with st.expander(f"📊 Backtest a signal on {sel}"):
@@ -725,3 +906,9 @@ if rows:
                                "fewer than the minimum trades.")
 else:
     st.caption("👆 Click a row to see its chart.")
+
+# ---------------- Sector calendar ----------------
+sector_cal = st.expander("🗓️ Sector rotation calendar", key="sector_cal_exp", on_change="rerun")
+with sector_cal:
+    if sector_cal.open:
+        render_sector_calendar()

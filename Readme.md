@@ -55,9 +55,14 @@ sortable table and a per-ticker drill-down chart.
   of close-to-close monthly returns (months as rows, years as columns) with each
   month's average, median and share of up years, a calendar-year row, a one-line
   summary of how the current month has usually gone, an average-month bar
-  chart, a "typical year" path with the current year overlaid, and
-  turn-of-month and day-of-week return charts. It loads the ticker's full history on its own, independent of the
-  History length setting
+  chart, a "typical year" path with the current year overlaid, turn-of-month
+  and day-of-week return charts, a "next 5/10/20/60 days from today" outlook,
+  and returns around holidays, options expiry, quarter-ends and (for stocks)
+  earnings. It lives in its own expander and loads the ticker's full history
+  only when opened, independent of the History length setting
+- **Sector rotation calendar** - average return by calendar month for each
+  sector ETF, raw or relative to SPY, with the historically strongest and
+  weakest for the coming month called out
 - **Backtesting** for the selected ticker - pick any crossover signal, the RSI
   mean-reversion rule, or the overall Bias score, choose direction (long/short/both),
   an exit rule (fixed holding period or until the opposite signal fires, with the
@@ -160,6 +165,8 @@ counting, SMA/MACD correctness) without needing network access or Streamlit.
   Tickers with dots (e.g. `BRK.B`) are normalized to Yahoo's dash format (`BRK-B`).
 - **Prices:** [Yahoo Finance](https://finance.yahoo.com/) via `yfinance`, downloaded
   in batches of 100 tickers to avoid one request per symbol.
+- **Earnings dates** (Seasonality section only): `yfinance`'s earnings calendar
+  for the selected ticker, up to the last 60 releases, cached for 24 hours.
 
 Both sources can rate-limit or go down; see
 [Nightly snapshot](#nightly-snapshot-and-offline-fallback) for how the app
@@ -231,7 +238,8 @@ avoids most live downloads and what it falls back to.
 
 ## Seasonality
 
-Below the chart for the selected ticker is a seasonality section built from
+Below the chart for the selected ticker is a **📅 Seasonality** expander
+(collapsed by default; nothing is downloaded until it's opened) built from
 **monthly close-to-close returns**: each month's last close vs the previous
 month's last close, on adjusted prices (so splits and dividends don't show up
 as fake moves).
@@ -274,6 +282,40 @@ Under that, using the same Years shown window:
 The turn-of-month and weekday effects are well documented historically but
 small next to daily noise and trading costs, and have faded since they became
 widely known; they're descriptive, not trade signals.
+
+Aimed more directly at timing a trade:
+
+- **From today's date**: for each past year, the return over the next 5, 10, 20
+  and 60 trading sessions starting from the same calendar date (entering at
+  the close of the last session on or before it, like buying at today's
+  close), summarized as Avg / Median / % Up / Best / Worst, with each year
+  available too. Best and Worst are there because the spread says more about
+  risk than the average.
+- **Around recurring events**: average daily return on the day before and
+  after a market holiday (holidays are read from the price data: a weekday
+  with no trading between two sessions), in options-expiry week (the week of
+  the third Friday) and the week after it, and in the last and first five
+  sessions of each quarter - shaded against the all-days average.
+- **Around earnings** (stocks only - ETFs have no earnings calendar and the
+  block is skipped): for each past release in range, the sessions before it
+  (1, 5 or 10 - the run-up), the reaction day (the first session to trade on
+  it: the same day for a release before the open, the next for one after the
+  close), and the sessions after it (5, 20 or 60 - post-earnings drift).
+  Defaults are 5 before and 20 after; 60 after starts to overlap the next
+  quarter's run-up.
+
+## Sector rotation calendar
+
+At the bottom of the page (independent of the selected ticker), an expander
+shows the average return in each calendar month for every sector ETF in the
+US Sector ETFs list, over the last 5/10/20/all years - either raw, with SPY
+added as a reference row, or **vs SPY** (each ETF's monthly return minus
+SPY's in the same month, which is what rotation is really about). The
+current and next month are in bold, and the three historically strongest and
+weakest ETFs for next month are listed underneath. Like the per-ticker view,
+it uses completed months only and loads the ETFs' full history (one batched
+request, cached for 24 hours) only when opened. Younger funds (XLRE, XLC)
+simply have fewer years.
 
 With 10 or so data points per month, a month that looks "strong" can easily
 be chance - especially as twelve months are compared at once. Treat it as a

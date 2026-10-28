@@ -67,6 +67,20 @@ def fetch_prices(tickers: tuple[str, ...], period: str = "1y") -> dict[str, pd.D
     return out
 
 
+def fetch_earnings_dates(ticker: str, limit: int = 60) -> list[pd.Timestamp]:
+    """Past earnings release times for one ticker, as naive US/Eastern
+    timestamps (oldest first). Empty for ETFs and anything Yahoo has no
+    earnings calendar for; raises only on a failed request."""
+    df = yf.Ticker(ticker).get_earnings_dates(limit=limit)
+    if df is None or df.empty:
+        return []
+    when = pd.DatetimeIndex(df.index)
+    if when.tz is not None:
+        when = when.tz_convert(MARKET_TZ).tz_localize(None)
+    now = datetime.now(MARKET_TZ).replace(tzinfo=None)
+    return sorted(t for t in when if t < now)
+
+
 def last_trading_day(now: datetime) -> date:
     """The most recent weekday whose regular session has closed as of `now`
     (tz-aware). Exchange holidays are ignored: on one, this asks for a bar that

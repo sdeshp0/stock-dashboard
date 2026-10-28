@@ -19,6 +19,7 @@ from signals.data_core import (
     BENCHMARK_TICKER,
     SNAPSHOT_PERIODS,
     download_snapshot,
+    fetch_earnings_dates,
     fetch_prices,
     fetch_sp500,
     slice_snapshot,
@@ -161,3 +162,21 @@ def load_long_history(ticker: str) -> pd.DataFrame:
     Always live (the snapshot only holds a year), and cached for a day since
     monthly returns barely move intraday. Raises if Yahoo returns nothing."""
     return fetch_prices((ticker,), "max")[ticker]
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def load_long_histories(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
+    """load_long_history for several tickers in one batched request (for the
+    sector calendar). Tickers Yahoo returns nothing for are simply missing."""
+    return fetch_prices(tickers, "max")
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False, max_entries=50)
+def load_earnings_dates(ticker: str) -> list[pd.Timestamp] | None:
+    """Past earnings release times, or None if the lookup failed (as opposed
+    to [] when the ticker simply has none, e.g. an ETF)."""
+    try:
+        return fetch_earnings_dates(ticker)
+    except Exception as e:
+        log.warning("Earnings dates for %s unavailable: %s", ticker, e)
+        return None
